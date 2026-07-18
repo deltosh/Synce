@@ -1658,16 +1658,21 @@ local function Shoot_Rage(targetPlayer)
     Ragebot_ShootBusy = true
     local ok, err = pcall(function()
         if Ragebot_WallbangOn() then
-            -- Criminality-style wallbang: briefly stand under the target and fire upward.
-            -- Server LOS sees you next to them, so the real shot deals damage through walls.
+            -- Under-target wallbang (no metamethod hooks — AC watches those)
+            local cam = workspace.CurrentCamera
             local savedCF = myHrp.CFrame
             local savedVel = myHrp.AssemblyLinearVelocity
+            local savedCam = cam and cam.CFrame
             local underPos = enemyHrp.Position - Vector3.new(0, 3.2, 0)
-            local shootCF = CFrame.lookAt(underPos, enemyAim.Position)
+            local lookAt = enemyAim.Position
+            local shootCF = CFrame.lookAt(underPos, lookAt)
 
             myHrp.AssemblyLinearVelocity = Vector3.zero
             myHrp.CFrame = shootCF
-            -- One frame so gun/camera settle before click
+            if cam then
+                -- Aim camera at target so the real gun ray hits them
+                cam.CFrame = CFrame.lookAt(underPos + Vector3.new(0, 1.4, 0), lookAt)
+            end
             RunService.Heartbeat:Wait()
             Ragebot_ClickMouse()
             local weapon = GetEquippedWeapon()
@@ -1676,11 +1681,13 @@ local function Shoot_Rage(targetPlayer)
                     weapon:Activate()
                 end)
             end
-            -- Hold position briefly so the shot packet uses under-target origin
             task.wait(0.06)
             if myHrp and myHrp.Parent then
                 myHrp.CFrame = savedCF
                 myHrp.AssemblyLinearVelocity = savedVel
+            end
+            if cam and savedCam then
+                cam.CFrame = savedCam
             end
         else
             Ragebot_ClickMouse()
@@ -3099,121 +3106,13 @@ end
 
 function hookShoot()
     for _, c in pairs(SAConns) do if c then c:Disconnect() end end; SAConns = {}
-    local LP = game.Players.LocalPlayer
-
-    -- Old FireServer hooks corrupt hits permanently until rejoin
+    -- No hookmetamethod / __index / __namecall — Criminality AC:
+    -- "indexInstance detector" / "namecallInstance detector"
+    _G.__SynexMouseSilent = nil
     _G.__SynexFireHooks = nil
     _G.__SynexSendingHit = nil
-
-    local function resolveCombatTarget()
-        if Ragebot_Enabled and Ragebot_Target then
-            return BuildRageSATarget(Ragebot_Target)
-        end
-        if SA.On then
-            local t = _G.CurSATarget or getValidT()
-            if t and canFire(t) then
-                return t
-            end
-        end
-        return nil
-    end
-
-    -- Aim redirect via Mouse.Hit/Target (does NOT hook FireServer — keeps hitmarkers)
-    if not _G.__SynexMouseSilent or _G.__SynexMouseSilent ~= SYNEX_GEN then
-        if typeof(hookmetamethod) == "function" then
-            local wrap = (typeof(newcclosure) == "function" and newcclosure) or function(fn)
-                return fn
-            end
-            local okHook = pcall(function()
-                local oldIndex
-                oldIndex = hookmetamethod(game, "__index", wrap(function(self, key)
-                    if (key == "Hit" or key == "Target") and typeof(self) == "Instance" then
-                        local fromUs = checkcaller and checkcaller()
-                        if not fromUs and (Ragebot_Enabled or SA.On) then
-                            local className = oldIndex(self, "ClassName")
-                            if className == "Mouse" then
-                                local t = resolveCombatTarget()
-                                if t and t.Part then
-                                    if key == "Hit" then
-                                        return CFrame.new(t.Part.Position)
-                                    end
-                                    return t.Part
-                                end
-                            end
-                        end
-                    end
-                    return oldIndex(self, key)
-                end))
-            end)
-            if okHook then
-                _G.__SynexMouseSilent = SYNEX_GEN
-            end
-        end
-    end
-
-    local function registerHits(gun, sc, sPos, projList)
-        if not ZFK_remote or not sc then return end
-        -- Only extra wallbang packets when wallbang modes need them
-        if not Ragebot_Enabled and not (SA.On and SA.AutoWall) then return end
-        local t = resolveCombatTarget()
-        if not t then return end
-        local c = LP.Character
-        if not c then return end
-
-        gun = gun or c:FindFirstChildOfClass("Tool") or GetEquippedWeapon()
-        if not gun then return end
-
-        local h = t.Char and t.Char:FindFirstChildOfClass("Humanoid")
-        if not h or h.Health <= 0 then return end
-
-        local basePart = t.Char:FindFirstChild("UpperTorso")
-            or t.Char:FindFirstChild("Torso")
-            or t.Char:FindFirstChild("HumanoidRootPart")
-            or t.Part
-        if not basePart then return end
-
-        local origin = (typeof(sPos) == "Vector3" and sPos)
-            or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position)
-            or basePart.Position
-
-        local count = (type(projList) == "table" and #projList > 0) and math.clamp(#projList, 1, 6) or 3
-        local healthBefore = h.Health
-
-        for i = 1, count do
-            local hitPos = basePart.Position
-            local dir = hitPos - origin
-            if dir.Magnitude < 0.001 then
-                dir = Vector3.new(0, 0, -1)
-            else
-                dir = dir.Unit
-            end
-            pcall(function()
-                ZFK_remote:FireServer("🧈", gun, sc, i, basePart, hitPos, dir)
-            end)
-        end
-
-        if Ragebot_Enabled then
-            task.delay(0.15, function()
-                if h and h.Parent then
-                    local dealt = healthBefore - h.Health
-                    if dealt > 0 then
-                        ShowRageDamage(dealt, t.Player and t.Player.Name or "TARGET", t.Char)
-                    end
-                end
-            end)
-        end
-    end
-
-    if ev2_bindable and ZFK_remote then
-        local viz = ev2_bindable:FindFirstChild("Visualize")
-        if viz then
-            local c = viz.Event:Connect(function(_, sc, _, gun, _, sPos, bps)
-                if not SA.On and not Ragebot_Enabled then return end
-                registerHits(gun, sc, sPos, bps)
-            end)
-            table.insert(SAConns, c)
-        end
-    end
+    -- Ragebot wallbang is teleport-under shoot (Shoot_Rage). Silent aim FOV
+    -- still updates CurSATarget via startSALoop; no remote rewrite here.
 end
 
 function SA_Enable()
