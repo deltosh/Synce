@@ -3058,6 +3058,10 @@ function hookShoot()
     for _, c in pairs(SAConns) do if c then c:Disconnect() end end; SAConns = {}
     local LP = game.Players.LocalPlayer
 
+    -- Old FireServer hooks corrupt hits permanently until rejoin
+    _G.__SynexFireHooks = nil
+    _G.__SynexSendingHit = nil
+
     local function resolveCombatTarget()
         if Ragebot_Enabled and Ragebot_Target then
             return BuildRageSATarget(Ragebot_Target)
@@ -3071,162 +3075,79 @@ function hookShoot()
         return nil
     end
 
-    local function combatAimPart()
-        local t = resolveCombatTarget()
-        return t and t.Part or nil
-    end
-
-    -- Redirect real gun remotes (hookfunction — NOT __namecall; AC watches namecall)
-    if not _G.__SynexFireHooks and typeof(hookfunction) == "function" then
-        local wrap = (typeof(newcclosure) == "function" and newcclosure) or function(fn)
-            return fn
-        end
-        local zfk = ZFK_remote or ZFKLF_H_Remote
-        local gnx = GNX_remote or GNX_S_Remote
-
-        if zfk then
-            local oldZ
-            oldZ = hookfunction(zfk.FireServer, wrap(function(self, ...)
-                if self ~= zfk or _G.__SynexSendingHit then
-                    return oldZ(self, ...)
-                end
-                if not Ragebot_Enabled and not SA.On then
-                    return oldZ(self, ...)
-                end
-                local part = combatAimPart()
-                if not part then
-                    return oldZ(self, ...)
-                end
-                local args = { ... }
-                local cam = workspace.CurrentCamera
-                local origin = cam and cam.CFrame.Position or part.Position
-                for i = 1, #args do
-                    if typeof(args[i]) == "Instance" and args[i]:IsA("BasePart") and i >= 4 then
-                        args[i] = part
-                        if typeof(args[i + 1]) == "Vector3" then
-                            args[i + 1] = part.Position
-                        end
-                        if typeof(args[i + 2]) == "Vector3" then
-                            local d = part.Position - origin
-                            args[i + 2] = d.Magnitude > 0.001 and d.Unit or Vector3.new(0, 0, -1)
-                        end
-                        break
-                    end
-                end
-                return oldZ(self, unpack(args))
-            end))
-        end
-
-        if gnx then
-            local oldG
-            oldG = hookfunction(gnx.FireServer, wrap(function(self, ...)
-                if self ~= gnx then
-                    return oldG(self, ...)
-                end
-                if not Ragebot_Enabled and not SA.On then
-                    return oldG(self, ...)
-                end
-                local part = combatAimPart()
-                if not part then
-                    return oldG(self, ...)
-                end
-                local args = { ... }
-                local cam = workspace.CurrentCamera
-                local origin = cam and cam.CFrame.Position or part.Position
-                local dir = part.Position - origin
-                if dir.Magnitude < 0.001 then
-                    dir = Vector3.new(0, 0, -1)
-                else
-                    dir = dir.Unit
-                end
-                for i = 1, #args do
-                    if type(args[i]) == "table" then
-                        local arr = args[i]
-                        if #arr > 0 and typeof(arr[1]) == "Vector3" then
-                            for j = 1, #arr do
-                                arr[j] = dir
+    -- Aim redirect via Mouse.Hit/Target (does NOT hook FireServer — keeps hitmarkers)
+    if not _G.__SynexMouseSilent or _G.__SynexMouseSilent ~= SYNEX_GEN then
+        if typeof(hookmetamethod) == "function" then
+            local wrap = (typeof(newcclosure) == "function" and newcclosure) or function(fn)
+                return fn
+            end
+            local okHook = pcall(function()
+                local oldIndex
+                oldIndex = hookmetamethod(game, "__index", wrap(function(self, key)
+                    if (key == "Hit" or key == "Target") and typeof(self) == "Instance" then
+                        local fromUs = checkcaller and checkcaller()
+                        if not fromUs and (Ragebot_Enabled or SA.On) then
+                            local className = oldIndex(self, "ClassName")
+                            if className == "Mouse" then
+                                local t = resolveCombatTarget()
+                                if t and t.Part then
+                                    if key == "Hit" then
+                                        return CFrame.new(t.Part.Position)
+                                    end
+                                    return t.Part
+                                end
                             end
                         end
                     end
-                end
-                return oldG(self, unpack(args))
-            end))
-        end
-
-        _G.__SynexFireHooks = true
-    end
-
-    local function parseShotArgs(...)
-        local args = { ... }
-        local sc, gun, sPos, dirs
-        for _, v in ipairs(args) do
-            local ty = typeof(v)
-            if not sc and ty == "string" and #v >= 2 and v ~= "🧈" and v ~= "🍞" then
-                sc = v
-            elseif not sc and ty == "number" then
-                sc = v
-            elseif not gun and ty == "Instance" then
-                gun = v
-            elseif not gun and ty == "string" and #v < 48 then
-                -- gun name string — resolve below
-            elseif not sPos and ty == "Vector3" then
-                sPos = v
-            elseif not dirs and type(v) == "table" then
-                dirs = v
+                    return oldIndex(self, key)
+                end))
+            end)
+            if okHook then
+                _G.__SynexMouseSilent = SYNEX_GEN
             end
         end
-        return gun, sc, sPos, dirs
     end
 
     local function registerHits(gun, sc, sPos, projList)
-        if not ZFK_remote or sc == nil then return end
+        if not ZFK_remote or not sc then return end
+        -- Only extra wallbang packets when wallbang modes need them
+        if not Ragebot_Enabled and not (SA.On and SA.AutoWall) then return end
         local t = resolveCombatTarget()
         if not t then return end
         local c = LP.Character
         if not c then return end
-        if typeof(gun) ~= "Instance" then
-            gun = c:FindFirstChildOfClass("Tool") or GetEquippedWeapon()
-        end
+
+        gun = gun or c:FindFirstChildOfClass("Tool") or GetEquippedWeapon()
         if not gun then return end
 
         local h = t.Char and t.Char:FindFirstChildOfClass("Humanoid")
         if not h or h.Health <= 0 then return end
 
-        local wallbang = Ragebot_Enabled or SA.AutoWall
-        local basePart = t.Part
-        if wallbang and t.Char then
-            basePart = t.Char:FindFirstChild("UpperTorso")
-                or t.Char:FindFirstChild("Torso")
-                or t.Char:FindFirstChild("HumanoidRootPart")
-                or t.Part
-        end
+        local basePart = t.Char:FindFirstChild("UpperTorso")
+            or t.Char:FindFirstChild("Torso")
+            or t.Char:FindFirstChild("HumanoidRootPart")
+            or t.Part
         if not basePart then return end
 
         local origin = (typeof(sPos) == "Vector3" and sPos)
             or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position)
             or basePart.Position
 
+        local count = (type(projList) == "table" and #projList > 0) and math.clamp(#projList, 1, 6) or 3
         local healthBefore = h.Health
-        local hitPos = basePart.Position
-        local dir = hitPos - origin
-        if dir.Magnitude < 0.001 then
-            dir = Vector3.new(0, 0, -1)
-        else
-            dir = dir.Unit
-        end
 
-        local count = 1
-        if type(projList) == "table" and #projList > 0 then
-            count = math.clamp(#projList, 1, 6)
-        end
-
-        _G.__SynexSendingHit = true
         for i = 1, count do
+            local hitPos = basePart.Position
+            local dir = hitPos - origin
+            if dir.Magnitude < 0.001 then
+                dir = Vector3.new(0, 0, -1)
+            else
+                dir = dir.Unit
+            end
             pcall(function()
                 ZFK_remote:FireServer("🧈", gun, sc, i, basePart, hitPos, dir)
             end)
         end
-        _G.__SynexSendingHit = false
 
         if Ragebot_Enabled then
             task.delay(0.15, function()
@@ -3239,19 +3160,17 @@ function hookShoot()
             end)
         end
     end
-    
+
     if ev2_bindable and ZFK_remote then
         local viz = ev2_bindable:FindFirstChild("Visualize")
         if viz then
-            local c = viz.Event:Connect(function(...)
+            local c = viz.Event:Connect(function(_, sc, _, gun, _, sPos, bps)
                 if not SA.On and not Ragebot_Enabled then return end
-                local gun, sc, sPos, bps = parseShotArgs(...)
                 registerHits(gun, sc, sPos, bps)
             end)
             table.insert(SAConns, c)
         end
     end
-    -- Local shots create Visualize; GNX OnClientEvent is often other players — skip to avoid bad sc
 end
 
 function SA_Enable()
