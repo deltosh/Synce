@@ -1145,6 +1145,8 @@ local Ragebot_SelectedHighlight = nil
 local Ragebot_EspConn = nil
 local Ragebot_LastShot = 0
 local Ragebot_Wallbang = true
+local Ragebot_ReloadUntil = 0
+local Ragebot_FireGap = 0.28 -- slower so R reload can finish
 -- Forward-declared so callbacks defined below bind to these locals (not globals)
 local Ragebot_Enabled = false
 local Ragebot_Coroutine = nil
@@ -1159,6 +1161,16 @@ _G.__RagebotFOVCircle.Filled = false
 _G.__RagebotFOVCircle.Transparency = 1
 _G.__RagebotFOVCircle.Visible = false
 _G.__RagebotWallbang = true
+
+local function Ragebot_IsReloading()
+    if UserInputService:IsKeyDown(Enum.KeyCode.R) then
+        return true
+    end
+    if tick() < Ragebot_ReloadUntil then
+        return true
+    end
+    return false
+end
 
 local function EnsureRageDamageUI()
     if Ragebot_DamageLabel and Ragebot_DamageLabel.Parent then
@@ -1442,25 +1454,25 @@ local function IsHoldingGun()
 end
 
 local function Ragebot_ClickMouse()
-    -- Do NOT use VirtualInputManager with screen coords — it teleports the mouse
-    -- and makes the FOV/camera jitter. Only fire a click at the current cursor.
+    -- Click only — never move cursor. Prefer executor mouse1* helpers.
+    local ok = false
     pcall(function()
         if mouse1click then
             mouse1click()
-            return
-        end
-        if mouse1press and mouse1release then
+            ok = true
+        elseif mouse1press and mouse1release then
             mouse1press()
-            task.wait()
+            task.wait(0.03)
             mouse1release()
-            return
+            ok = true
         end
     end)
+    if ok then return end
     pcall(function()
         local vim = game:GetService("VirtualInputManager")
         local pos = UserInputService:GetMouseLocation()
         vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
-        task.wait()
+        task.wait(0.03)
         vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
     end)
 end
@@ -1620,6 +1632,7 @@ end
 
 local function Shoot_Rage(targetPlayer)
     if not targetPlayer or not targetPlayer.Character then return end
+    if Ragebot_IsReloading() then return end
 
     if not GNX_S_Remote or not ZFKLF_H_Remote then
         warn("Ragebot Error: Required remote events not found.")
@@ -1629,14 +1642,8 @@ local function Shoot_Rage(targetPlayer)
         return
     end
 
-    local weapon = GetEquippedWeapon()
-    -- Always click — Criminality custom hotbar may not expose a normal Tool
-    task.spawn(Ragebot_ClickMouse)
-    if weapon and weapon:IsA("Tool") then
-        pcall(function()
-            weapon:Activate()
-        end)
-    end
+    -- One clean click so the game creates a real shot key (needed for damage)
+    Ragebot_ClickMouse()
 end
 
 local function RagebotEspLoop()
@@ -1661,14 +1668,16 @@ local function RagebotLoop()
     while Ragebot_Enabled and SynexAlive() do
         local target = GetClosestEnemy_Rage()
         Ragebot_Target = target
-        -- Do NOT gate on IsHoldingGun — Criminality custom hotbar often has no Tool.Handle
-        if target then
+
+        if Ragebot_IsReloading() then
+            task.wait(0.05)
+        elseif target then
             local now = tick()
-            if now - Ragebot_LastShot >= 0.06 then
+            if now - Ragebot_LastShot >= Ragebot_FireGap then
                 Ragebot_LastShot = now
                 Shoot_Rage(target)
             end
-            task.wait(0.03)
+            task.wait(0.05)
         else
             task.wait(0.08)
         end
@@ -1730,8 +1739,12 @@ if _G.__RagebotKeyConn and _G.__RagebotKeyConn.Connected then
     _G.__RagebotKeyConn:Disconnect()
 end
 _G.__RagebotKeyConn = UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
-    if gameProcessedEvent then return end
     if not SynexAlive() then return end
+    -- Pause auto-fire while reloading so R works even with a target in FOV
+    if input.KeyCode == Enum.KeyCode.R then
+        Ragebot_ReloadUntil = tick() + 2.8
+    end
+    if gameProcessedEvent then return end
     if not _G.__RagebotBind or _G.__RagebotBind == Enum.KeyCode.Unknown then return end
     if input.KeyCode == _G.__RagebotBind then
         if Ragebot_Enabled then
@@ -3058,13 +3071,122 @@ function hookShoot()
         return nil
     end
 
+    local function combatAimPart()
+        local t = resolveCombatTarget()
+        return t and t.Part or nil
+    end
+
+    -- Redirect real gun remotes (hookfunction — NOT __namecall; AC watches namecall)
+    if not _G.__SynexFireHooks and typeof(hookfunction) == "function" then
+        local wrap = (typeof(newcclosure) == "function" and newcclosure) or function(fn)
+            return fn
+        end
+        local zfk = ZFK_remote or ZFKLF_H_Remote
+        local gnx = GNX_remote or GNX_S_Remote
+
+        if zfk then
+            local oldZ
+            oldZ = hookfunction(zfk.FireServer, wrap(function(self, ...)
+                if self ~= zfk or _G.__SynexSendingHit then
+                    return oldZ(self, ...)
+                end
+                if not Ragebot_Enabled and not SA.On then
+                    return oldZ(self, ...)
+                end
+                local part = combatAimPart()
+                if not part then
+                    return oldZ(self, ...)
+                end
+                local args = { ... }
+                local cam = workspace.CurrentCamera
+                local origin = cam and cam.CFrame.Position or part.Position
+                for i = 1, #args do
+                    if typeof(args[i]) == "Instance" and args[i]:IsA("BasePart") and i >= 4 then
+                        args[i] = part
+                        if typeof(args[i + 1]) == "Vector3" then
+                            args[i + 1] = part.Position
+                        end
+                        if typeof(args[i + 2]) == "Vector3" then
+                            local d = part.Position - origin
+                            args[i + 2] = d.Magnitude > 0.001 and d.Unit or Vector3.new(0, 0, -1)
+                        end
+                        break
+                    end
+                end
+                return oldZ(self, unpack(args))
+            end))
+        end
+
+        if gnx then
+            local oldG
+            oldG = hookfunction(gnx.FireServer, wrap(function(self, ...)
+                if self ~= gnx then
+                    return oldG(self, ...)
+                end
+                if not Ragebot_Enabled and not SA.On then
+                    return oldG(self, ...)
+                end
+                local part = combatAimPart()
+                if not part then
+                    return oldG(self, ...)
+                end
+                local args = { ... }
+                local cam = workspace.CurrentCamera
+                local origin = cam and cam.CFrame.Position or part.Position
+                local dir = part.Position - origin
+                if dir.Magnitude < 0.001 then
+                    dir = Vector3.new(0, 0, -1)
+                else
+                    dir = dir.Unit
+                end
+                for i = 1, #args do
+                    if type(args[i]) == "table" then
+                        local arr = args[i]
+                        if #arr > 0 and typeof(arr[1]) == "Vector3" then
+                            for j = 1, #arr do
+                                arr[j] = dir
+                            end
+                        end
+                    end
+                end
+                return oldG(self, unpack(args))
+            end))
+        end
+
+        _G.__SynexFireHooks = true
+    end
+
+    local function parseShotArgs(...)
+        local args = { ... }
+        local sc, gun, sPos, dirs
+        for _, v in ipairs(args) do
+            local ty = typeof(v)
+            if not sc and ty == "string" and #v >= 2 and v ~= "🧈" and v ~= "🍞" then
+                sc = v
+            elseif not sc and ty == "number" then
+                sc = v
+            elseif not gun and ty == "Instance" then
+                gun = v
+            elseif not gun and ty == "string" and #v < 48 then
+                -- gun name string — resolve below
+            elseif not sPos and ty == "Vector3" then
+                sPos = v
+            elseif not dirs and type(v) == "table" then
+                dirs = v
+            end
+        end
+        return gun, sc, sPos, dirs
+    end
+
     local function registerHits(gun, sc, sPos, projList)
-        if not ZFK_remote or not sc then return end
+        if not ZFK_remote or sc == nil then return end
         local t = resolveCombatTarget()
         if not t then return end
         local c = LP.Character
         if not c then return end
-        gun = gun or c:FindFirstChildOfClass("Tool") or GetEquippedWeapon()
+        if typeof(gun) ~= "Instance" then
+            gun = c:FindFirstChildOfClass("Tool") or GetEquippedWeapon()
+        end
         if not gun then return end
 
         local h = t.Char and t.Char:FindFirstChildOfClass("Humanoid")
@@ -3084,28 +3206,30 @@ function hookShoot()
             or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position)
             or basePart.Position
 
-        local count = (type(projList) == "table" and #projList > 0) and #projList or 3
         local healthBefore = h.Health
-
-        -- Immediate packets (delayed packs often get rejected)
-        for i = 1, count do
-            local tp = basePart
-            local hitPos = tp.Position
-            local dir = hitPos - origin
-            if dir.Magnitude < 0.001 then
-                dir = Vector3.new(0, 0, -1)
-            else
-                dir = dir.Unit
-            end
-            pcall(function()
-                ZFK_remote:FireServer("🧈", gun, sc, i, tp, hitPos, dir)
-            end)
+        local hitPos = basePart.Position
+        local dir = hitPos - origin
+        if dir.Magnitude < 0.001 then
+            dir = Vector3.new(0, 0, -1)
+        else
+            dir = dir.Unit
         end
 
-        -- Do NOT Fire Hitmarker here — that shows fake hits with no damage
+        local count = 1
+        if type(projList) == "table" and #projList > 0 then
+            count = math.clamp(#projList, 1, 6)
+        end
+
+        _G.__SynexSendingHit = true
+        for i = 1, count do
+            pcall(function()
+                ZFK_remote:FireServer("🧈", gun, sc, i, basePart, hitPos, dir)
+            end)
+        end
+        _G.__SynexSendingHit = false
 
         if Ragebot_Enabled then
-            task.delay(0.12, function()
+            task.delay(0.15, function()
                 if h and h.Parent then
                     local dealt = healthBefore - h.Health
                     if dealt > 0 then
@@ -3119,20 +3243,15 @@ function hookShoot()
     if ev2_bindable and ZFK_remote then
         local viz = ev2_bindable:FindFirstChild("Visualize")
         if viz then
-            local c = viz.Event:Connect(function(_, sc, _, gun, _, sPos, bps)
+            local c = viz.Event:Connect(function(...)
                 if not SA.On and not Ragebot_Enabled then return end
+                local gun, sc, sPos, bps = parseShotArgs(...)
                 registerHits(gun, sc, sPos, bps)
             end)
             table.insert(SAConns, c)
         end
     end
-    if GNX_remote and ZFK_remote then
-        local c = GNX_remote.OnClientEvent:Connect(function(st, sc, gun, ft, sPos, dirs, silenced)
-            if not SA.On and not Ragebot_Enabled then return end
-            registerHits(gun, sc, sPos, dirs)
-        end)
-        table.insert(SAConns, c)
-    end
+    -- Local shots create Visualize; GNX OnClientEvent is often other players — skip to avoid bad sc
 end
 
 function SA_Enable()
@@ -3154,127 +3273,7 @@ function SA_Disable()
     _G.CurSATarget = nil; lastT = nil; lastDmg = false
 end
 
--------------------------------------------------------------------------------
--- Ragebot wallbang (Criminality)
--- Visualize / GNX events only (no namecall).
--- MUST use the gun instance from the shot event — Criminality often does not
--- parent a Tool to Character, so FindFirstChildOfClass("Tool") fails and we
--- used to return early (hitmarker only, no server damage).
--------------------------------------------------------------------------------
-do
-    local LP = game.Players.LocalPlayer
-    local RageConns = {}
-
-    local function resolveZfk()
-        return ZFK_remote
-            or ZFKLF_H_Remote
-            or (EventsFolder and EventsFolder:FindFirstChild("ZFKLF__H"))
-    end
-
-    local function rageWallbangPart(char)
-        if not char then return nil end
-        return char:FindFirstChild("UpperTorso")
-            or char:FindFirstChild("Torso")
-            or char:FindFirstChild("HumanoidRootPart")
-            or char:FindFirstChild("LowerTorso")
-            or char:FindFirstChild("Head")
-    end
-
-    local function currentRageTarget()
-        if not Ragebot_Enabled then return nil end
-        local p = Ragebot_Target
-        if not p or not p.Character then return nil end
-        local hum = p.Character:FindFirstChildOfClass("Humanoid")
-        if not hum or hum.Health <= 0 then return nil end
-        return p
-    end
-
-    local function fireWallbangHits(gun, sc, sPos, projList)
-        local zfk = resolveZfk()
-        if not zfk or not sc then return end
-
-        local target = currentRageTarget()
-        if not target then return end
-
-        -- Prefer gun from the real shot event (required for Criminality)
-        gun = gun or GetEquippedWeapon()
-        if not gun then return end
-
-        local part = rageWallbangPart(target.Character)
-        if not part then return end
-
-        local origin = (typeof(sPos) == "Vector3" and sPos)
-            or (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position)
-            or part.Position
-
-        local count = (type(projList) == "table" and #projList > 0) and #projList or 3
-        if count < 1 then count = 3 end
-
-        local hum = target.Character:FindFirstChildOfClass("Humanoid")
-        local healthBefore = hum and hum.Health or nil
-
-        -- Register hits immediately with the real shot key (no delay / no fake Hitmarker)
-        for i = 1, count do
-            part = rageWallbangPart(target.Character) or part
-            local hitPos = part.Position
-            local dir = hitPos - origin
-            if dir.Magnitude < 0.001 then
-                dir = Vector3.new(0, 0, -1)
-            else
-                dir = dir.Unit
-            end
-            pcall(function()
-                zfk:FireServer("🧈", gun, sc, i, part, hitPos, dir)
-            end)
-        end
-
-        -- Extra HRP register (same sc) for wallbang reliability
-        local hrp = target.Character:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local hp = hrp.Position
-            local d2 = hp - origin
-            if d2.Magnitude < 0.001 then
-                d2 = Vector3.new(0, 0, -1)
-            else
-                d2 = d2.Unit
-            end
-            for i = 1, math.min(count, 3) do
-                pcall(function()
-                    zfk:FireServer("🧈", gun, sc, i, hrp, hp, d2)
-                end)
-            end
-        end
-
-        if healthBefore and hum then
-            task.delay(0.12, function()
-                if hum and hum.Parent then
-                    local dealt = healthBefore - hum.Health
-                    if dealt > 0 then
-                        ShowRageDamage(dealt, target.Name, target.Character)
-                    end
-                end
-            end)
-        end
-    end
-
-    if ev2_bindable then
-        local viz = ev2_bindable:FindFirstChild("Visualize")
-        if viz then
-            table.insert(RageConns, viz.Event:Connect(function(_, sc, _, gun, _, sPos, bps)
-                if not Ragebot_Enabled then return end
-                fireWallbangHits(gun, sc, sPos, bps)
-            end))
-        end
-    end
-
-    local gnx = GNX_remote or GNX_S_Remote
-    if gnx then
-        table.insert(RageConns, gnx.OnClientEvent:Connect(function(st, sc, gun, ft, sPos, dirs, silenced)
-            if not Ragebot_Enabled then return end
-            fireWallbangHits(gun, sc, sPos, dirs)
-        end))
-    end
-end
+-- Rage wallbang damage path lives in hookShoot() (single handler — no duplicate ZFK spam)
 
 --========================== Infinite Stamina ========================--
 local InfStamina_Enabled = false
