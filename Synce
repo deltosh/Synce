@@ -1146,7 +1146,8 @@ local Ragebot_EspConn = nil
 local Ragebot_LastShot = 0
 local Ragebot_Wallbang = true
 local Ragebot_ReloadUntil = 0
-local Ragebot_FireGap = 0.28 -- slower so R reload can finish
+local Ragebot_FireGap = 0.32
+local Ragebot_ShootBusy = false
 -- Forward-declared so callbacks defined below bind to these locals (not globals)
 local Ragebot_Enabled = false
 local Ragebot_Coroutine = nil
@@ -1170,6 +1171,10 @@ local function Ragebot_IsReloading()
         return true
     end
     return false
+end
+
+local function Ragebot_WallbangOn()
+    return Ragebot_Wallbang or _G.__RagebotWallbang
 end
 
 local function EnsureRageDamageUI()
@@ -1633,17 +1638,58 @@ end
 local function Shoot_Rage(targetPlayer)
     if not targetPlayer or not targetPlayer.Character then return end
     if Ragebot_IsReloading() then return end
+    if Ragebot_ShootBusy then return end
 
-    if not GNX_S_Remote or not ZFKLF_H_Remote then
-        warn("Ragebot Error: Required remote events not found.")
-        if typeof(Ragebot_Disable) == "function" then
-            Ragebot_Disable()
-        end
+    local myChar = LocalPlayer.Character
+    local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    local enemyChar = targetPlayer.Character
+    local enemyHrp = enemyChar and enemyChar:FindFirstChild("HumanoidRootPart")
+    local enemyAim = enemyChar and (
+        enemyChar:FindFirstChild("UpperTorso")
+        or enemyChar:FindFirstChild("Torso")
+        or enemyChar:FindFirstChild("Head")
+        or enemyHrp
+    )
+    if not (myHrp and enemyHrp and enemyAim) then
+        Ragebot_ClickMouse()
         return
     end
 
-    -- One clean click so the game creates a real shot key (needed for damage)
-    Ragebot_ClickMouse()
+    Ragebot_ShootBusy = true
+    local ok, err = pcall(function()
+        if Ragebot_WallbangOn() then
+            -- Criminality-style wallbang: briefly stand under the target and fire upward.
+            -- Server LOS sees you next to them, so the real shot deals damage through walls.
+            local savedCF = myHrp.CFrame
+            local savedVel = myHrp.AssemblyLinearVelocity
+            local underPos = enemyHrp.Position - Vector3.new(0, 3.2, 0)
+            local shootCF = CFrame.lookAt(underPos, enemyAim.Position)
+
+            myHrp.AssemblyLinearVelocity = Vector3.zero
+            myHrp.CFrame = shootCF
+            -- One frame so gun/camera settle before click
+            RunService.Heartbeat:Wait()
+            Ragebot_ClickMouse()
+            local weapon = GetEquippedWeapon()
+            if weapon and weapon:IsA("Tool") then
+                pcall(function()
+                    weapon:Activate()
+                end)
+            end
+            -- Hold position briefly so the shot packet uses under-target origin
+            task.wait(0.06)
+            if myHrp and myHrp.Parent then
+                myHrp.CFrame = savedCF
+                myHrp.AssemblyLinearVelocity = savedVel
+            end
+        else
+            Ragebot_ClickMouse()
+        end
+    end)
+    Ragebot_ShootBusy = false
+    if not ok then
+        warn("Ragebot shoot error:", err)
+    end
 end
 
 local function RagebotEspLoop()
@@ -1687,20 +1733,17 @@ local function RagebotLoop()
 end
 
 local function Ragebot_Enable()
-    if not GNX_S_Remote or not ZFKLF_H_Remote then
-         warn("Ragebot cannot enable: Required remote events not found.")
-         pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Ragebot Error", Text = "Required remotes missing.", Duration = 5}) end)
-         return
-    end
     if Ragebot_Enabled then return end
     Ragebot_Enabled = true
     print("Rage Bot enabled")
     pcall(enableNoRecoil)
-    pcall(hookShoot) -- install shared damage path (also used by silent aim)
+    pcall(hookShoot)
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
             Title = "Rage Bot",
-            Text = "enabled — center FOV + wallbang + no recoil",
+            Text = Ragebot_WallbangOn()
+                and "enabled — FOV + under-target wallbang"
+                or "enabled — FOV auto fire",
             Duration = 3
         })
     end)
@@ -4189,6 +4232,15 @@ local function InitializeSynexUI()
         callback = function(v)
             _G.__RagebotFOVRadius = v
             if _G.__RagebotFOVCircle then _G.__RagebotFOVCircle.Radius = v end
+        end,
+    })
+
+    rageSec:AddToggle({
+        name = "wallbang",
+        default = Ragebot_Wallbang,
+        callback = function(v)
+            Ragebot_Wallbang = v and true or false
+            _G.__RagebotWallbang = Ragebot_Wallbang
         end,
     })
 
