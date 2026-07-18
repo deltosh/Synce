@@ -1743,8 +1743,7 @@ local function Ragebot_Enable()
     if Ragebot_Enabled then return end
     Ragebot_Enabled = true
     print("Rage Bot enabled")
-    pcall(enableNoRecoil)
-    pcall(hookShoot)
+    -- no recoil left off by default (optional UI toggle) — safer on Criminality
     pcall(function()
         game:GetService("StarterGui"):SetCore("SendNotification", {
             Title = "Rage Bot",
@@ -1853,15 +1852,12 @@ local Shadow_Usable = true
 do
     repeat task.wait() until game:IsLoaded();
 
-    local svc_ref = cloneref or function(...) return ... end;
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local CoreGui = game:GetService("CoreGui")
+    local StarterGui = game:GetService("StarterGui")
 
-    local GS = setmetatable({}, {
-        __index = function(_, k)
-            return svc_ref(game:GetService(k));
-        end
-    });
-
-    local P = GS.Players.LocalPlayer;
+    local P = Players.LocalPlayer;
     local Char = P.Character or P.CharacterAdded:Wait();
     local HMND
     local HRP
@@ -1883,12 +1879,12 @@ do
     local CamoAnim = Instance.new("Animation", nil);
     CamoAnim.AnimationId = "rbxassetid://215384594";
 
-    local RS = GS.RunService;
+    local RS = RunService;
     local UpdateFrame = RS.Heartbeat;
     local WaitRender = RS.RenderStepped;
 
-    local CoreGS = GS.CoreGui;
-    local StartGS = GS.StarterGui;
+    local CoreGS = CoreGui;
+    local StartGS = StarterGui;
 
     local HUD = Instance.new("ScreenGui");
     HUD.Name = "ShadowWarningHUD";
@@ -3106,13 +3102,9 @@ end
 
 function hookShoot()
     for _, c in pairs(SAConns) do if c then c:Disconnect() end end; SAConns = {}
-    -- No hookmetamethod / __index / __namecall — Criminality AC:
-    -- "indexInstance detector" / "namecallInstance detector"
     _G.__SynexMouseSilent = nil
     _G.__SynexFireHooks = nil
     _G.__SynexSendingHit = nil
-    -- Ragebot wallbang is teleport-under shoot (Shoot_Rage). Silent aim FOV
-    -- still updates CurSATarget via startSALoop; no remote rewrite here.
 end
 
 function SA_Enable()
@@ -3180,15 +3172,13 @@ local Invis_Fixed = true
 do
     repeat task.wait() until game:IsLoaded();
 
-    local cloneref = cloneref or function(...) return ... end;
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local UserInputService = game:GetService("UserInputService")
+    local CoreGui = game:GetService("CoreGui")
+    local StarterGui = game:GetService("StarterGui")
 
-    local Service = setmetatable({}, {
-        __index = function(_, k)
-            return cloneref(game:GetService(k));
-        end
-    });
-
-    local Player = Service.Players.LocalPlayer;
+    local Player = Players.LocalPlayer;
     local Character = Player.Character or Player.CharacterAdded:Wait();
     local Humanoid
     local HumanoidRootPart
@@ -3211,13 +3201,8 @@ do
     local Animation = Instance.new("Animation");
     Animation.AnimationId = "rbxassetid://215384594";
 
-    local RunService = Service.RunService;
     local Heartbeat = RunService.Heartbeat;
     local RenderStepped = RunService.RenderStepped;
-
-    local UserInputService = Service.UserInputService;
-    local CoreGui = Service.CoreGui;
-    local StarterGui = Service.StarterGui;
 
     if Character and not Character:FindFirstChild("Torso") then
         pcall(function()
